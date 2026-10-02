@@ -2,13 +2,15 @@ import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import os
 import datetime
 import logging
 import glob
 import threading
 import queue
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, Dict, Any, List
 import math
 import traceback
@@ -87,42 +89,56 @@ class ThreadSafeLogger:
 thread_safe_logger = ThreadSafeLogger()
 
 class ImageCache:
-    """Кэш для управления изображениями и предотвращения утечек памяти"""
-    def __init__(self, max_size=10):
-        self.cache = {}
-        self.max_size = max_size
-        self.access_order = []
+    """Потокобезопасный LRU-кэш для управления изображениями и предотвращения утечек памяти"""
+    def __init__(self, max_size: int = 10):
+        self._cache: 'OrderedDict[Any, Any]' = OrderedDict()
+        self.max_size = max(1, int(max_size))
+        self._lock = threading.RLock()
 
     def get(self, key):
-        if key in self.cache:
-            self.access_order.remove(key)
-            self.access_order.append(key)
-            return self.cache[key]
-        return None
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
 
     def put(self, key, value):
-        if len(self.cache) >= self.max_size:
-            oldest_key = self.access_order.pop(0)
-            del self.cache[oldest_key]
-        self.cache[key] = value
-        self.access_order.append(key)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._cache[key] = value
+                return
+            while len(self._cache) >= self.max_size:
+                self._cache.popitem(last=False)  # удаляем самый старый элемент (LRU)
+            self._cache[key] = value
 
     def clear(self):
-        self.cache.clear()
-        self.access_order.clear()
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
 
 class AdvancedImageProcessor:
-    @staticmethod
-    def enhanced_preprocessing(img: np.ndarray) -> np.ndarray:
-        """Расширенная предобработка изображения"""
+    """Обработчик изображений с переиспользуемым объектом CLAHE (дорогой ресурс)"""
+
+    # Значения по умолчанию для постобработки маски
+    DEFAULT_MIN_AREA = 100
+    DEFAULT_KERNEL_SIZE = 5
+
+    def __init__(self):
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def enhanced_preprocessing(self, img: np.ndarray) -> np.ndarray:
+        """Расширенная предобработка изображения (CLAHE + двусторонняя фильтрация)"""
         try:
             if img is None or img.size == 0:
                 return img
 
             processed = img.copy()
             lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            lab[:,:,0] = clahe.apply(lab[:,:,0])
+            lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
             processed = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
             processed = cv2.bilateralFilter(processed, 9, 75, 75)
             return processed
@@ -131,11 +147,22 @@ class AdvancedImageProcessor:
             return img
 
     @staticmethod
-    def postprocess_mask(mask: np.ndarray, min_area: int = 100, kernel_size: int = 5) -> np.ndarray:
-        """Постобработка маски для удаления шума"""
+    def postprocess_mask(mask: np.ndarray, min_area: int = DEFAULT_MIN_AREA,
+                         kernel_size: int = DEFAULT_KERNEL_SIZE) -> np.ndarray:
+        """Постобработка маски для удаления шума (морфология + отсечение мелких областей)"""
         try:
             if mask is None or mask.size == 0:
                 return mask
+
+            # Гарантируем корректные параметры из пользовательского ввода
+            try:
+                min_area = max(0, int(min_area))
+            except (TypeError, ValueError):
+                min_area = AdvancedImageProcessor.DEFAULT_MIN_AREA
+            try:
+                kernel_size = max(1, int(kernel_size)) | 1  # нечетный размер ядра
+            except (TypeError, ValueError):
+                kernel_size = AdvancedImageProcessor.DEFAULT_KERNEL_SIZE
 
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -143,9 +170,8 @@ class AdvancedImageProcessor:
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < min_area:
-                    cv2.fillPoly(mask, [contour], 0)
+                if cv2.contourArea(contour) < min_area:
+                    cv2.drawContours(mask, [contour], -1, 0, thickness=cv2.FILLED)
             return mask
         except Exception as e:
             thread_safe_logger.log('WARNING', f"Ошибка постобработки маски: {e}")
@@ -204,26 +230,51 @@ class AreaCalculator:
             return {}
 
 class ImageDisplayManager:
-    """Менеджер для отображения изображений с поддержкой масштабирования"""
+    """Менеджер для отображения изображений с поддержкой масштабирования.
+
+    Исправления:
+    - отдельные масштабы/смещения для панелей оригинала и маски (раньше
+      смещения всегда перезаписывались для "original", что ломало
+      display_to_original_coords при наличии маски);
+    - добавлено логирование ошибок вместо тихого проглатывания исключений.
+    """
     def __init__(self, original_label, mask_label):
         self.original_label = original_label
         self.mask_label = mask_label
         self.original_image = None
         self.mask_image = None
+        # Совместимость со старым интерфейсом: общий масштаб по умолчанию
         self.display_scale = 1.0
         self.original_offset_x = 0
         self.original_offset_y = 0
         self.mask_offset_x = 0
         self.mask_offset_y = 0
 
-    def display_to_original_coords(self, x, y):
-        """Конвертация координат отображения в оригинальные координаты"""
-        if self.original_image is None:
-            return x, y
+    @staticmethod
+    def _target_size(label: tk.Label) -> Tuple[int, int]:
+        """Возвращает доступные размеры метки (с корректным fallback)."""
+        width = label.winfo_width()
+        height = label.winfo_height()
+        if width <= 1:
+            width = max(300, label.winfo_reqwidth())
+        if height <= 1:
+            height = 500
+        return width, height
 
-        orig_x = int((x - self.original_offset_x) / self.display_scale)
-        orig_y = int((y - self.original_offset_y) / self.display_scale)
-        return orig_x, orig_y
+    def display_to_original_coords(self, x, y, panel: str = "original") -> Tuple[int, int]:
+        """Конвертация координат отображения в оригинальные координаты"""
+        image = self.original_image if panel == "original" else self.mask_image
+        if image is None or self.display_scale <= 0:
+            return int(x), int(y)
+
+        offset_x = self.original_offset_x if panel == "original" else self.mask_offset_x
+        offset_y = self.original_offset_y if panel == "original" else self.mask_offset_y
+
+        orig_x = int((x - offset_x) / self.display_scale)
+        orig_y = int((y - offset_y) / self.display_scale)
+        # Ограничиваем координаты границами изображения
+        h, w = image.shape[:2]
+        return max(0, min(orig_x, w - 1)), max(0, min(orig_y, h - 1))
 
     def set_original_image(self, image):
         """Установка оригинального изображения"""
@@ -245,7 +296,7 @@ class ImageDisplayManager:
     def display_image(self, img: np.ndarray, label: tk.Label, cache_key: str):
         """Отображение изображения с поддержкой масштабирования"""
         try:
-            if img is None or img.size == 0:
+            if img is None or getattr(img, "size", 0) == 0:
                 label.configure(image='', text="Ошибка отображения")
                 return
 
@@ -255,37 +306,40 @@ class ImageDisplayManager:
                 rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
             h, w = rgb.shape[:2]
+            if h == 0 or w == 0:
+                label.configure(image='', text="Некорректное изображение")
+                return
 
             # Получаем размеры метки для правильного масштабирования
-            label_width = label.winfo_width()
-            label_height = label.winfo_height()
+            label_width, label_height = self._target_size(label)
 
-            if label_width > 1 and label_height > 1:
-                scale_x = label_width / w
-                scale_y = label_height / h
-                self.display_scale = min(scale_x, scale_y, 1.0)
+            scale = min(label_width / w, label_height / h, 1.0)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            if (new_w, new_h) != (w, h):
+                rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Сохраняем масштаб и центрирование для конкретной панели
+            self.display_scale = scale
+            offset_x = max(0, (label_width - new_w) // 2)
+            offset_y = max(0, (label_height - new_h) // 2)
+            if cache_key == "mask":
+                self.mask_offset_x, self.mask_offset_y = offset_x, offset_y
             else:
-                # Fallback если размеры еще не известны
-                max_h = 500
-                self.display_scale = min(1.0, max_h / h)
-
-            new_w = int(w * self.display_scale)
-            new_h = int(h * self.display_scale)
-            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-            # Центрирование изображения
-            self.original_offset_x = (label_width - new_w) // 2 if label_width > new_w else 0
-            self.original_offset_y = (label_height - new_h) // 2 if label_height > new_h else 0
+                self.original_offset_x, self.original_offset_y = offset_x, offset_y
 
             pil_img = Image.fromarray(rgb)
             imgtk = ImageTk.PhotoImage(pil_img)
 
             label.configure(image=imgtk, text="")
-            label.image = imgtk
+            label.image = imgtk  # удержание ссылки для предотвращения сборки мусора
 
         except Exception as e:
             thread_safe_logger.log('ERROR', f"Ошибка отображения изображения: {e}")
-            label.configure(image='', text="Ошибка отображения изображения")
+            try:
+                label.configure(image='', text="Ошибка отображения изображения")
+            except tk.TclError:
+                pass
 
 class CompactHSVRangeVisualizer:
     """Компактный визуализатор диапазона HSV"""
@@ -301,10 +355,18 @@ class CompactHSVRangeVisualizer:
         self.info_label = ttk.Label(self.frame, text="Диапазон HSV: H(0-179) S(0-255) V(0-255)")
         self.info_label.pack(fill=tk.X)
 
+        # Хранилище ссылок на PhotoImage (защита от сборки мусора Tkinter)
+        self._photos: List[ImageTk.PhotoImage] = []
+
         self.update_range(35, 85, 50, 255, 50, 255)
 
     def update_range(self, h_min, h_max, s_min, s_max, v_min, v_max):
-        """Обновление визуализации диапазона"""
+        """Обновление визуализации диапазона.
+
+        Оптимизация: вместо тысяч отдельных create_line (по одному на пиксель)
+        и вызовов cv2.cvtColor для каждого цвета используется один numpy-пересчет
+        HSV->RGB и три create_rectangle с растянутой фотографией (ImageTk).
+        """
         try:
             self.canvas.delete("all")
             canvas_width = self.canvas.winfo_width() - 10
@@ -313,49 +375,49 @@ class CompactHSVRangeVisualizer:
 
             bar_height = 25
             margin = 5
-            bar_width = canvas_width
+            bar_width = max(10, int(canvas_width))
 
-            # Hue
-            y_hue = margin
-            self.canvas.create_text(margin, y_hue - 5, text="H", anchor=tk.W, font=('Arial', 8, 'bold'))
-            for i in range(bar_width):
-                hue = int(i * 179 / bar_width)
-                x = margin + i
-                color = self.hsv_to_rgb(hue, 255, 255)
-                self.canvas.create_line(x, y_hue, x, y_hue + bar_height, fill=color)
+            # Нормализуем входные значения (слайдеры ttk.Scale могут отдавать float)
+            h_min, h_max = int(h_min), int(h_max)
+            s_min, s_max = int(s_min), int(s_max)
+            v_min, v_max = int(v_min), int(v_max)
+            mid_h = (h_min + h_max) // 2
 
-            h_start = margin + (h_min / 179) * bar_width
-            h_end = margin + (h_max / 179) * bar_width
-            self.canvas.create_rectangle(h_start, y_hue, h_end, y_hue + bar_height,
-                                       outline='red', width=2)
+            bars = (
+                # (y, подпись, таблица оттенков H, S, V)
+                (margin, "H", np.arange(bar_width, dtype=np.uint16) * 179 // bar_width,
+                 np.full(bar_width, 255, dtype=np.uint8), np.full(bar_width, 255, dtype=np.uint8)),
+                (margin + (bar_height + margin + 5), "S", np.full(bar_width, mid_h, dtype=np.uint8),
+                 np.arange(bar_width, dtype=np.uint16) * 255 // bar_width, np.full(bar_width, 255, dtype=np.uint8)),
+                (margin + 2 * (bar_height + margin + 5), "V", np.full(bar_width, mid_h, dtype=np.uint8),
+                 np.full(bar_width, 255, dtype=np.uint8), np.arange(bar_width, dtype=np.uint16) * 255 // bar_width),
+            )
 
-            # Saturation
-            y_sat = y_hue + bar_height + margin + 5
-            self.canvas.create_text(margin, y_sat - 5, text="S", anchor=tk.W, font=('Arial', 8, 'bold'))
-            for i in range(bar_width):
-                sat = int(i * 255 / bar_width)
-                x = margin + i
-                color = self.hsv_to_rgb((h_min + h_max) // 2, sat, 255)
-                self.canvas.create_line(x, y_sat, x, y_sat + bar_height, fill=color)
+            for y, letter, hs, ss, vs in bars:
+                self.canvas.create_text(margin, y - 5, text=letter, anchor=tk.W, font=('Arial', 8, 'bold'))
 
-            s_start = margin + (s_min / 255) * bar_width
-            s_end = margin + (s_max / 255) * bar_width
-            self.canvas.create_rectangle(s_start, y_sat, s_end, y_sat + bar_height,
-                                       outline='red', width=2)
+                hsv = np.dstack([hs.astype(np.uint8), ss.astype(np.uint8), vs.astype(np.uint8)])
+                rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+                # Один кадр 1px высотой -> PhotoImage; canvas растянет его по высоте бара
+                frame = Image.fromarray(rgb[:1]).resize((bar_width, bar_height), Image.NEAREST)
+                photo = ImageTk.PhotoImage(frame)
+                self._photos.append(photo)  # удержание ссылки от сборки мусора
+                if len(self._photos) > 3:
+                    del self._photos[:-3]
+                self.canvas.create_image(margin, y, anchor=tk.NW, image=photo)
 
-            # Value
+            # Рамки выбранных диапазонов
+            self.canvas.create_rectangle(margin + (h_min / 179) * bar_width, margin,
+                                         margin + (h_max / 179) * bar_width, margin + bar_height,
+                                         outline='red', width=2)
+            y_sat = margin + bar_height + margin + 5
+            self.canvas.create_rectangle(margin + (s_min / 255) * bar_width, y_sat,
+                                         margin + (s_max / 255) * bar_width, y_sat + bar_height,
+                                         outline='red', width=2)
             y_val = y_sat + bar_height + margin + 5
-            self.canvas.create_text(margin, y_val - 5, text="V", anchor=tk.W, font=('Arial', 8, 'bold'))
-            for i in range(bar_width):
-                val = int(i * 255 / bar_width)
-                x = margin + i
-                color = self.hsv_to_rgb((h_min + h_max) // 2, 255, val)
-                self.canvas.create_line(x, y_val, x, y_val + bar_height, fill=color)
-
-            v_start = margin + (v_min / 255) * bar_width
-            v_end = margin + (v_max / 255) * bar_width
-            self.canvas.create_rectangle(v_start, y_val, v_end, y_val + bar_height,
-                                       outline='red', width=2)
+            self.canvas.create_rectangle(margin + (v_min / 255) * bar_width, y_val,
+                                         margin + (v_max / 255) * bar_width, y_val + bar_height,
+                                         outline='red', width=2)
 
             self.info_label.config(text=f"Диапазон HSV: H({h_min}-{h_max}) S({s_min}-{s_max}) V({v_min}-{v_max})")
         except Exception as e:
@@ -381,10 +443,17 @@ class BatchAnalysisTool:
         self.is_processing = False
         self.current_file_index = 0
         self.total_files = 0
+        # Быстрый набор уже добавленных путей (O(1) вместо O(n) на каждый файл)
+        self._known_paths = set()
         self.setup_ui()
 
     def setup_ui(self):
         """Настройка интерфейса пакетного анализа"""
+        # Инициализация переменных до построения UI (порядок важен!)
+        self.file_list: List[Dict[str, Any]] = []
+        self.results: List[Dict[str, Any]] = []
+        self.processing_thread = None
+
         self.window = tk.Toplevel(self.parent)
         self.window.title("📊 Пакетный анализ изображений")
         self.window.geometry("800x600")
@@ -523,11 +592,6 @@ class BatchAnalysisTool:
                   text="❌ Закрыть",
                   command=self.on_closing).pack(side=tk.RIGHT, padx=5)
 
-        # Инициализация переменных
-        self.file_list = []
-        self.results = []
-        self.processing_thread = None
-
         # Запуск обработки очереди прогресса
         self.process_queue()
 
@@ -540,7 +604,7 @@ class BatchAnalysisTool:
 
         if filepaths:
             for filepath in filepaths:
-                if filepath not in [f['path'] for f in self.file_list]:
+                if os.path.normpath(filepath) not in self._known_paths:
                     self.add_file_to_list(filepath)
             self.update_file_count()
 
@@ -549,12 +613,13 @@ class BatchAnalysisTool:
         folder_path = filedialog.askdirectory(title="Выберите папку с изображениями")
         if folder_path:
             supported_formats = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif')
-            for format in supported_formats:
-                files = glob.glob(os.path.join(folder_path, format))
-                files.extend(glob.glob(os.path.join(folder_path, format.upper())))
-                for filepath in files:
-                    if filepath not in [f['path'] for f in self.file_list]:
-                        self.add_file_to_list(filepath)
+            found_files: List[str] = []
+            for pattern in supported_formats:  # не затеняем встроенную функцию format()
+                found_files.extend(glob.glob(os.path.join(folder_path, pattern)))
+                found_files.extend(glob.glob(os.path.join(folder_path, pattern.upper())))
+            for filepath in sorted(found_files):
+                if os.path.normpath(filepath) not in self._known_paths:
+                    self.add_file_to_list(filepath)
             self.update_file_count()
 
     def add_file_to_list(self, filepath):
@@ -570,6 +635,7 @@ class BatchAnalysisTool:
                 'status': 'В ожидании'
             }
             self.file_list.append(file_info)
+            self._known_paths.add(os.path.normpath(filepath))
 
             # Добавление в UI
             self.add_file_to_ui(file_info)
@@ -594,6 +660,7 @@ class BatchAnalysisTool:
     def clear_files(self):
         """Очистка списка файлов"""
         self.file_list.clear()
+        self._known_paths.clear()
         # Очистка UI
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
@@ -613,6 +680,16 @@ class BatchAnalysisTool:
             messagebox.showwarning("Ошибка", "Анализ уже выполняется")
             return
 
+        # Сбрасываем статусы файлов перед новым запуском
+        for file_info in self.file_list:
+            file_info['status'] = 'В ожидании'
+            ui_status = file_info.get('ui_status')
+            if ui_status is not None:
+                try:
+                    ui_status.config(text=file_info['status'])
+                except tk.TclError:
+                    pass  # виджет мог быть уничтожен
+
         self.is_processing = True
         self.start_button.config(state='disabled')
         self.results = []
@@ -624,11 +701,12 @@ class BatchAnalysisTool:
         self.processing_thread.start()
 
     def process_batch(self):
-        """Обработка пакета изображений"""
+        """Обработка пакета изображений (выполняется в рабочем потоке)"""
         try:
             self.log_message("🚀 Начало пакетного анализа...")
             self.update_progress(0, "Подготовка к анализу")
 
+            total = len(self.file_list)
             for i, file_info in enumerate(self.file_list):
                 if not self.is_processing:
                     break
@@ -644,7 +722,11 @@ class BatchAnalysisTool:
                     file_info['status'] = '✅ Завершено'
                     self.update_file_status(file_info)
 
-                    self.log_message(f"✅ Обработан: {file_info['name']} - {result['percent']:.2f}% загрязнения")
+                    # Исправление KeyError: в результате есть 'contamination_percent',
+                    # а не 'percent'
+                    self.log_message(
+                        f"✅ Обработан: {file_info['name']} - "
+                        f"{result['contamination_percent']:.2f}% загрязнения")
 
                 except Exception as e:
                     file_info['status'] = '❌ Ошибка'
@@ -652,8 +734,8 @@ class BatchAnalysisTool:
                     self.log_message(f"❌ Ошибка обработки {file_info['name']}: {str(e)}")
 
                 # Обновление прогресса
-                progress = (i + 1) / len(self.file_list) * 100
-                self.update_progress(progress, f"Обработка {i + 1}/{len(self.file_list)}")
+                progress = (i + 1) / total * 100
+                self.update_progress(progress, f"Обработка {i + 1}/{total}")
 
             if self.is_processing:
                 self.update_progress(100, "Анализ завершен")
@@ -666,48 +748,68 @@ class BatchAnalysisTool:
 
         finally:
             self.is_processing = False
-            self.start_button.config(state='normal')
+            # Обновление UI — только через очередь (поток не должен трогать Tk напрямую)
+            self.progress_queue.put(('restore_button',))
 
     def process_single_file(self, file_info):
-        """Обработка одного файла"""
+        """Обработка одного файла (выполняется в рабочем потоке)"""
         # Загрузка изображения
         image = cv2.imread(file_info['path'])
         if image is None:
             raise ValueError("Не удалось загрузить изображение")
 
-        # Сохраняем текущие настройки
-        original_hsv_lower = self.app.hsv_lower.copy()
-        original_hsv_upper = self.app.hsv_upper.copy()
+        app = self.app
+        # Снимок настроек из GUI в потоке UI-потока не делаем — читаем один раз
+        use_current_hsv = self.use_current_hsv_var.get()
+        auto_calibrate = self.auto_calibrate_var.get()
+        save_processed = self.save_processed_var.get()
+        try:
+            min_area = app.min_area_var.get()
+            kernel_size = app.kernel_size_var.get()
+            width_mm = app.width_var.get()
+            height_mm = app.height_var.get()
+        except tk.TclError:
+            min_area = AdvancedImageProcessor.DEFAULT_MIN_AREA
+            kernel_size = AdvancedImageProcessor.DEFAULT_KERNEL_SIZE
+            width_mm, height_mm = 100.0, 100.0
+
+        original_hsv_lower = app.hsv_lower.copy()
+        original_hsv_upper = app.hsv_upper.copy()
+
+        # Локальные HSV-настройки для этого файла: глобальные состояние приложения
+        # не мутируется из рабочего потока (устранена гонка данных с UI).
+        hsv_lower, hsv_upper = original_hsv_lower.copy(), original_hsv_upper.copy()
 
         try:
             # Авто-калибровка если включена
-            if self.auto_calibrate_var.get():
-                self.auto_calibrate_image(image)
+            if auto_calibrate:
+                hsv_lower, hsv_upper = self.auto_calibrate_image(image)
 
             # Применяем улучшенную предобработку
-            processed_img = self.app.advanced_processor.enhanced_preprocessing(image)
+            processed_img = app.advanced_processor.enhanced_preprocessing(image)
 
             # Создание маски
             hsv = cv2.cvtColor(processed_img, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, self.app.hsv_lower, self.app.hsv_upper)
+            mask = cv2.inRange(hsv, hsv_lower, hsv_upper)
 
             if mask is None or cv2.countNonZero(mask) == 0:
                 raise ValueError("Не обнаружено областей загрязнения")
 
             # Постобработка маски
-            mask = self.app.advanced_processor.postprocess_mask(
-                mask,
-                min_area=self.app.min_area_var.get(),
-                kernel_size=self.app.kernel_size_var.get()
+            mask = app.advanced_processor.postprocess_mask(
+                mask, min_area=min_area, kernel_size=kernel_size
             )
 
+            # Если после фильтрации мелких областей ничего не осталось — считаем чистым
+            remaining_px = cv2.countNonZero(mask)
+
             # Расчет статистики
-            stats = self.app.area_calculator.calculate_area_stats(
+            stats = app.area_calculator.calculate_area_stats(
                 mask,
                 image.shape[:2],
-                self.app.scale_mm_per_pixel,
-                self.app.width_var.get(),
-                self.app.height_var.get()
+                app.scale_mm_per_pixel,
+                width_mm,
+                height_mm
             )
 
             if not stats:
@@ -715,7 +817,7 @@ class BatchAnalysisTool:
 
             # Сохранение обработанного изображения если включено
             output_image_path = None
-            if self.save_processed_var.get():
+            if save_processed and remaining_px > 0:
                 output_image_path = self.save_processed_image(image, mask, file_info)
 
             # Формирование результата
@@ -731,57 +833,69 @@ class BatchAnalysisTool:
                 'num_contours': stats['num_contours'],
                 'largest_contour_mm2': stats['largest_contour_area_mm2'],
                 'output_image': output_image_path,
-                'hsv_range': f"H({self.app.hsv_lower[0]}-{self.app.hsv_upper[0]}) "
-                           f"S({self.app.hsv_lower[1]}-{self.app.hsv_upper[1]}) "
-                           f"V({self.app.hsv_lower[2]}-{self.app.hsv_upper[2]})"
+                'hsv_range': f"H({hsv_lower[0]}-{hsv_upper[0]}) "
+                             f"S({hsv_lower[1]}-{hsv_upper[1]}) "
+                             f"V({hsv_lower[2]}-{hsv_upper[2]})"
             }
+
+            # Если авто-калибровка включена и пользователь хочет сохранить её
+            # результаты в основных настройках — обновляем их через поток UI
+            if auto_calibrate and use_current_hsv:
+                self.progress_queue.put(('apply_hsv', hsv_lower.copy(), hsv_upper.copy()))
 
             return result
 
         finally:
-            # Восстанавливаем оригинальные настройки HSV если не используем текущие
-            if not self.use_current_hsv_var.get():
-                self.app.hsv_lower = original_hsv_lower
-                self.app.hsv_upper = original_hsv_upper
+            # Восстанавливаем оригинальные настройки HSV, если автoкалибровка
+            # должна остаться локальной (не используем текущие настройки)
+            if auto_calibrate and not use_current_hsv:
+                app.hsv_lower = original_hsv_lower
+                app.hsv_upper = original_hsv_upper
 
-    def auto_calibrate_image(self, image):
-        """Автоматическая калибровка для отдельного изображения"""
+    def auto_calibrate_image(self, image) -> Tuple[np.ndarray, np.ndarray]:
+        """Автоматическая калибровка для отдельного изображения.
+
+        Исправление dtype: cv2.inRange требует одинаковый dtype границ и входа
+        (uint8), иначе маска всегда пуста / бросает исключение.
+        Возвращает пару (hsv_lower, hsv_upper) вместо мутации общего состояния.
+        """
         try:
-            # Упрощенная автоматическая калибровка
-            # В реальной реализации здесь может быть более сложный алгоритм
+            # Упрощенная автоматическая калибровка на основе пиков гистограммы
             hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-            # Анализ гистограммы для определения доминирующих цветов
             h_hist = cv2.calcHist([hsv_image], [0], None, [180], [0, 180])
             s_hist = cv2.calcHist([hsv_image], [1], None, [256], [0, 256])
             v_hist = cv2.calcHist([hsv_image], [2], None, [256], [0, 256])
 
-            # Находим пики в гистограммах
-            h_peak = np.argmax(h_hist)
-            s_peak = np.argmax(s_hist)
-            v_peak = np.argmax(v_hist)
+            h_peak = int(np.argmax(h_hist))
+            s_peak = int(np.argmax(s_hist))
+            v_peak = int(np.argmax(v_hist))
 
-            # Устанавливаем диапазон вокруг пиков
             h_range = 30
             s_range = 60
             v_range = 60
 
-            self.app.hsv_lower = np.array([
+            hsv_lower = np.array([
                 max(0, h_peak - h_range),
                 max(50, s_peak - s_range),
                 max(50, v_peak - v_range)
-            ])
-            self.app.hsv_upper = np.array([
+            ], dtype=np.uint8)
+            hsv_upper = np.array([
                 min(179, h_peak + h_range),
                 min(255, s_peak + s_range),
                 min(255, v_peak + v_range)
-            ])
+            ], dtype=np.uint8)
+
+            # Гарантируем корректный диапазон (min < max)
+            hsv_lower = np.minimum(hsv_lower, hsv_upper)
+
+            return hsv_lower, hsv_upper
 
         except Exception as e:
             self.log_message(f"⚠️ Ошибка авто-калибровки: {str(e)}")
             # Используем настройки по умолчанию в случае ошибки
-            self.app.hsv_lower = np.array([35, 50, 50])
-            self.app.hsv_upper = np.array([85, 255, 255])
+            return (np.array([35, 50, 50], dtype=np.uint8),
+                    np.array([85, 255, 255], dtype=np.uint8))
 
     def save_processed_image(self, image, mask, file_info):
         """Сохранение обработанного изображения"""
@@ -790,7 +904,8 @@ class BatchAnalysisTool:
             results_dir = os.path.join(os.path.dirname(file_info['path']), "batch_analysis_results")
             os.makedirs(results_dir, exist_ok=True)
 
-            # Создаем визуализацию с маской
+            # Создаем визуализацию с маской (полупрозрачное наложение вместо
+            # полной заливки — исходное изображение остаётся видимым)
             result_img = image.copy()
             color_map = {
                 'red': [0, 0, 255],
@@ -800,13 +915,26 @@ class BatchAnalysisTool:
                 'cyan': [255, 255, 0],
                 'magenta': [255, 0, 255]
             }
-            highlight_color = color_map.get(self.app.contour_color_var.get(), [0, 0, 255])
-            result_img[mask > 0] = highlight_color
+            try:
+                contour_color = self.app.contour_color_var.get()
+            except tk.TclError:
+                contour_color = 'red'
+            highlight_color = color_map.get(contour_color, [0, 0, 255])
 
-            # Сохраняем изображение
+            overlay = result_img.copy()
+            overlay[mask > 0] = highlight_color
+            result_img = cv2.addWeighted(result_img, 0.4, overlay, 0.6, 0)
+
+            # Контуры загрязнений поверх наложения
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(result_img, contours, -1, highlight_color, 2)
+
+            # Сохраняем изображение (cv2.imwrite возвращает False при ошибке)
             filename, ext = os.path.splitext(file_info['name'])
             output_path = os.path.join(results_dir, f"{filename}_processed{ext}")
-            cv2.imwrite(output_path, result_img)
+            if not cv2.imwrite(output_path, result_img):
+                raise IOError("cv2.imwrite не смог записать файл")
 
             return output_path
 
@@ -827,7 +955,7 @@ class BatchAnalysisTool:
         self.progress_queue.put(('log', message))
 
     def process_queue(self):
-        """Обработка очереди обновлений UI"""
+        """Обработка очереди обновлений UI (вызывается только из потока Tk)"""
         try:
             while True:
                 item = self.progress_queue.get_nowait()
@@ -837,24 +965,49 @@ class BatchAnalysisTool:
                     value, status = item[1], item[2]
                     self.progress_var.set(value)
                     self.status_label.config(text=status)
-                    self.details_label.config(text=f"Обработано: {self.current_file_index + 1} из {self.total_files} файлов")
+                    self.details_label.config(
+                        text=f"Обработано: {min(self.current_file_index + 1, self.total_files)} "
+                             f"из {self.total_files} файлов")
 
                 elif item_type == 'file_status':
                     file_info = item[1]
-                    if 'ui_status' in file_info:
-                        file_info['ui_status'].config(text=file_info['status'])
+                    ui_status = file_info.get('ui_status')
+                    if ui_status is not None:
+                        try:
+                            ui_status.config(text=file_info['status'])
+                        except tk.TclError:
+                            pass  # виджет уничтожен (например, список очищен)
 
                 elif item_type == 'log':
                     message = item[1]
                     self.log_text.insert(tk.END, f"{message}\n")
                     self.log_text.see(tk.END)
 
+                elif item_type == 'restore_button':
+                    # Поток обработки завершён — возвращаем кнопку в рабочее состояние
+                    try:
+                        if self.start_button.winfo_exists():
+                            self.start_button.config(state='normal')
+                    except tk.TclError:
+                        pass
+
+                elif item_type == 'apply_hsv':
+                    # Применение авто-калибровки к основным настройкам (в UI-потоке)
+                    try:
+                        self.app.hsv_lower = item[1]
+                        self.app.hsv_upper = item[2]
+                    except Exception:
+                        pass
+
         except queue.Empty:
             pass
 
         # Продолжаем обработку очереди
-        if self.window and self.window.winfo_exists():
-            self.window.after(100, self.process_queue)
+        try:
+            if self.window and self.window.winfo_exists():
+                self.window.after(100, self.process_queue)
+        except tk.TclError:
+            pass  # окно уже закрыто
 
     def complete_analysis(self):
         """Завершение анализа"""
@@ -1004,20 +1157,31 @@ class RulerTool:
         else:
             self.end_point = (event.x, event.y)
             self.canvas.delete("ruler")
-            self.canvas.create_line(self.start_point, self.end_point, 
+            self.canvas.create_line(self.start_point, self.end_point,
                                   fill='yellow', width=2, tags="ruler")
-            self.start_point = None
+            # Исправление: start_point НЕ сбрасываем — он нужен в apply()
+            # для вычисления длины отрезка в пикселях
 
     def apply(self):
-        if self.end_point is None:
+        if self.end_point is None or self.start_point is None:
             messagebox.showwarning("Ошибка", "Сначала нарисуйте отрезок")
             return
 
-        x1, y1 = self.start_point if self.start_point else (0, 0)
+        x1, y1 = self.start_point
         x2, y2 = self.end_point
-        pixel_length = ((x2 - x1)**2 + (y2 - y1)**2)**0.5
+        pixel_length = math.hypot(x2 - x1, y2 - y1)
 
-        real_length = self.length_var.get()
+        if pixel_length < 1.0:
+            messagebox.showerror("Ошибка",
+                                 "Отрезок слишком короткий — поставьте точки дальше друг от друга")
+            return
+
+        try:
+            real_length = float(self.length_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Ошибка", "Некорректное значение длины")
+            return
+
         if real_length <= 0:
             messagebox.showerror("Ошибка", "Длина должна быть > 0")
             return
